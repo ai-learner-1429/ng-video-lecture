@@ -1,3 +1,5 @@
+# %%
+import time
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
@@ -14,8 +16,21 @@ n_embd = 384
 n_head = 6
 n_layer = 6
 dropout = 0.2
+
+# Performnace tracking
+# v1, original
+# n_iter=500 -> (train_loss=1.7472, val_loss=1.9069)
+# n_iter=5000 -> (train_loss=0.8529, val_loss=1.5588)
+# 39s for 500 training iterations (32s) + 1 estimate_loss (7s)
+# v2, combine Head and MultiHeadAttentionOrig into MultiHeadAttention
+# n_iter=500 -> (train_loss=1.7135, val_loss=1.8786)
+# n_iter=5000 -> (train_loss=0.6427, val_loss=1.7790)
+# 27s for 500 training iterations (20s) + 1 estimate_loss (7s), a 60% speedup.
+
 # ------------
 
+# %%
+# Load data and inspect
 torch.manual_seed(1337)
 
 # wget https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt
@@ -34,16 +49,17 @@ decode = lambda l: ''.join([itos[i] for i in l]) # decoder: take a list of integ
 # Train and test splits
 data = torch.tensor(encode(text), dtype=torch.long)
 n = int(0.9*len(data)) # first 90% will be train, rest val
-train_data = data[:n]
-val_data = data[n:]
+train_data = data[:n]  # len=1.00e6
+val_data = data[n:]  # len=0.11e6
 
+# %%
 # data loading
 def get_batch(split):
     # generate a small batch of data of inputs x and targets y
     data = train_data if split == 'train' else val_data
     ix = torch.randint(len(data) - block_size, (batch_size,))
-    x = torch.stack([data[i:i+block_size] for i in ix])
-    y = torch.stack([data[i+1:i+block_size+1] for i in ix])
+    x = torch.stack([data[i:i+block_size] for i in ix])  # (batch_size, block_size/max_seq_length)
+    y = torch.stack([data[i+1:i+block_size+1] for i in ix])  # same shape as x
     x, y = x.to(device), y.to(device)
     return x, y
 
@@ -61,6 +77,8 @@ def estimate_loss():
     model.train()
     return out
 
+# %%
+# Define the modules
 class Head(nn.Module):
     """ one head of self-attention """
 
@@ -69,6 +87,7 @@ class Head(nn.Module):
         self.key = nn.Linear(n_embd, head_size, bias=False)
         self.query = nn.Linear(n_embd, head_size, bias=False)
         self.value = nn.Linear(n_embd, head_size, bias=False)
+        # Use register_buffer as "tril" is not learnable.
         self.register_buffer('tril', torch.tril(torch.ones(block_size, block_size)))
 
         self.dropout = nn.Dropout(dropout)
@@ -76,6 +95,7 @@ class Head(nn.Module):
     def forward(self, x):
         # input of size (batch, time-step, channels)
         # output of size (batch, time-step, head size)
+        # Note that we should have T <= block_size.
         B,T,C = x.shape
         k = self.key(x)   # (B,T,hs)
         q = self.query(x) # (B,T,hs)
@@ -83,13 +103,14 @@ class Head(nn.Module):
         wei = q @ k.transpose(-2,-1) * k.shape[-1]**-0.5 # (B, T, hs) @ (B, hs, T) -> (B, T, T)
         wei = wei.masked_fill(self.tril[:T, :T] == 0, float('-inf')) # (B, T, T)
         wei = F.softmax(wei, dim=-1) # (B, T, T)
+        # attention dropout
         wei = self.dropout(wei)
         # perform the weighted aggregation of the values
         v = self.value(x) # (B,T,hs)
         out = wei @ v # (B, T, T) @ (B, T, hs) -> (B, T, hs)
         return out
 
-class MultiHeadAttention(nn.Module):
+class MultiHeadAttentionOrig(nn.Module):
     """ multiple heads of self-attention in parallel """
 
     def __init__(self, num_heads, head_size):
@@ -99,7 +120,45 @@ class MultiHeadAttention(nn.Module):
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
-        out = torch.cat([h(x) for h in self.heads], dim=-1)
+        out = torch.cat([h(x) for h in self.heads], dim=-1)  # (B, T, hs*n_heads)
+        out = self.dropout(self.proj(out))
+        return out
+    
+class MultiHeadAttention(nn.Module):
+    # Combining Head and MultiHeadAttentionOrig into one class for vectorization
+
+    def __init__(self, num_heads, head_size):
+        super().__init__()
+        self.num_heads = num_heads
+        self.head_size = head_size
+
+        self.ks = nn.Linear(n_embd, head_size * num_heads, bias=False)
+        self.qs = nn.Linear(n_embd, head_size * num_heads, bias=False)
+        self.vs = nn.Linear(n_embd, head_size * num_heads, bias=False)
+        self.register_buffer('tril', torch.tril(torch.ones(block_size, block_size)))
+
+        self.proj = nn.Linear(head_size * num_heads, n_embd)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        # Step1: get attention weights
+        B, T, hidden_size = x.shape
+        hs, H = self.head_size, self.num_heads
+        # assert hidden_size == hs * H, f"Dimension mismatch, x.shape={x.shape}, hidden_size={hs}, num_heads={H}"
+        ks = self.ks(x).view(B,T,hs,H)  # (B,T,hs,H)
+        qs = self.qs(x).view(B,T,hs,H)  # (B,T,hs,H)
+        attn_w = qs.permute(0,3,1,2) @ ks.permute(0,3,2,1) * hs**-0.5  # (B,H,T,hs) @ (B,H,hs,T) -> (B,H,T,T)
+        attn_w = attn_w.masked_fill(self.tril[:T, :T] == 0, float('-inf')) # (B,H,T,T)
+        attn_w = F.softmax(attn_w, dim=-1) # (B,H,T,T)
+
+        # Step2: compute context vector
+        vs = self.vs(x).view(B,T,hs,H)
+        out = attn_w @ vs.permute(0,3,1,2)  # (B,H,T,T) @ (B,H,T,hs) -> (B,H,T,hs)
+        # view() doesn't work here due to size/stride incompatibility.
+        # out = out.permute(0,2,3,1).view(B,T,-1)
+        out = out.permute(0,2,3,1).reshape(B,T,-1)
+
+        # ffw/feed-forward dropout
         out = self.dropout(self.proj(out))
         return out
 
@@ -195,6 +254,8 @@ class GPTLanguageModel(nn.Module):
             idx = torch.cat((idx, idx_next), dim=1) # (B, T+1)
         return idx
 
+# %%
+# Model creation and training
 model = GPTLanguageModel()
 m = model.to(device)
 # print the number of parameters in the model
@@ -203,12 +264,14 @@ print(sum(p.numel() for p in m.parameters())/1e6, 'M parameters')
 # create a PyTorch optimizer
 optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
 
+start_time = time.time()
 for iter in range(max_iters):
 
     # every once in a while evaluate the loss on train and val sets
     if iter % eval_interval == 0 or iter == max_iters - 1:
         losses = estimate_loss()
-        print(f"step {iter}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
+        cur_time = time.time()
+        print(f"step {iter}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f} (time elapsed={cur_time - start_time:.0f}s)")
 
     # sample a batch of data
     xb, yb = get_batch('train')
