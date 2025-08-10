@@ -24,8 +24,12 @@ dropout = 0.2
 # 39s for 500 training iterations (32s) + 1 estimate_loss (7s)
 # v2, combine Head and MultiHeadAttentionOrig into MultiHeadAttention
 # n_iter=500 -> (train_loss=1.7135, val_loss=1.8786)
-# n_iter=5000 -> (train_loss=0.6427, val_loss=1.7790)
-# 27s for 500 training iterations (20s) + 1 estimate_loss (7s), a 60% speedup.
+# n_iter=5000 -> (train_loss=0.6427, val_loss=1.7790), val_loss +14%!
+# 27s for 500 training iterations (20s) + 1 estimate_loss (7s), a 60% speedup (for training).
+# v3, add back attention dropout
+# n_iter=500 -> (train_loss=1.7294, val_loss=1.8938)
+# n_iter=5000 -> (train_loss=0.8562, val_loss=1.5594)
+# 28s for 500 training iterations (21s) + 1 estimate_loss (7s), a 5% slowdown.
 
 # ------------
 
@@ -150,6 +154,8 @@ class MultiHeadAttention(nn.Module):
         attn_w = qs.permute(0,3,1,2) @ ks.permute(0,3,2,1) * hs**-0.5  # (B,H,T,hs) @ (B,H,hs,T) -> (B,H,T,T)
         attn_w = attn_w.masked_fill(self.tril[:T, :T] == 0, float('-inf')) # (B,H,T,T)
         attn_w = F.softmax(attn_w, dim=-1) # (B,H,T,T)
+        # attention dropout
+        attn_w = self.dropout(attn_w)
 
         # Step2: compute context vector
         vs = self.vs(x).view(B,T,hs,H)
